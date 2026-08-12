@@ -31,16 +31,26 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rtabmap/utilite/UConversion.h>
 #include <rtabmap/core/Compression.h>
 #include <rtabmap/core/Version.h>
-#ifdef WIN32
 #include <rtabmap/core/Parameters.h>
-#endif
 
 #include "rtflann/flann.hpp"
 #include <boost/crc.hpp>
 
 namespace rtabmap {
 
-FlannIndex::FlannIndex():
+FlannIndex* FlannIndex::create(Type type)
+{
+	if (type == kNanoFlann) {
+		return new NanoFlannIndex();
+	}
+	return new RtFlannIndex();
+}
+
+// 2. Добавляем пустой конструктор и деструктор для интерфейса
+FlannIndex::FlannIndex() {}
+FlannIndex::~FlannIndex() {}
+
+RtFlannIndex::RtFlannIndex():
 		index_(0),
 		nextIndex_(0),
 		featuresType_(0),
@@ -49,12 +59,12 @@ FlannIndex::FlannIndex():
 		rebalancingFactor_(2.0f)
 {
 }
-FlannIndex::~FlannIndex()
+RtFlannIndex::~RtFlannIndex()
 {
 	this->release();
 }
 
-void FlannIndex::release()
+void RtFlannIndex::release()
 {
 	if(index_)
 	{
@@ -88,7 +98,7 @@ void FlannIndex::release()
 
 #define FLANN_INDEX_HEADER_SIZE 12
 
-std::vector<unsigned char> FlannIndex::serializeIndex(bool computeChecksum) const {
+std::vector<unsigned char> RtFlannIndex::serializeIndex(bool computeChecksum) const {
 	if(index_ && !addedDescriptors_.empty())
 	{
 #ifdef WIN32
@@ -125,6 +135,22 @@ std::vector<unsigned char> FlannIndex::serializeIndex(bool computeChecksum) cons
 		if(bytes_written < long(indexData.size()-headerSizeBytes))
 		{
 			//Expected data size and type
+			//
+			// dataType is stored in the header as a raw cv::Mat type and
+			// compared against features.type() on load. That value is NOT
+			// stable across OpenCV major versions: OpenCV 5 changed
+			// CV_CN_SHIFT from 3 to 5, so a multi-channel type serializes to
+			// a different integer than under OpenCV 4 (see the encoding
+			// helpers in Compression.cpp, which normalize it for the data
+			// blobs stored in the database).
+			//
+			// It is safe here only because descriptors are always
+			// single-channel (asserted CV_32FC1 or CV_8UC1 in buildKDTreeIndex()
+			// and friends), and 1-channel types have the same value in both
+			// versions. A mismatch would only make loadIndex() refuse the
+			// index and rebuild it, never corrupt data -- but if descriptors
+			// ever become multi-channel, this field needs the same
+			// normalization as Compression.cpp.
 			int dataRows = 0;
 			int dataCols = 0;
 			int dataType = -1;
@@ -176,11 +202,11 @@ std::vector<unsigned char> FlannIndex::serializeIndex(bool computeChecksum) cons
 				result.process_bytes(dataset.data, dataset.total()*dataset.elemSize());
 				crcValue = result.checksum(); 
 			}
-			
+
 			indexData.resize(bytes_written+headerSizeBytes);
 			indexData.shrink_to_fit();
-			int rebalancingFactorAsInt;
-			memcpy(&rebalancingFactorAsInt, &rebalancingFactor_, sizeof(rebalancingFactor_));
+			int rebalancingFactorAsInt; // Deprecated
+			memcpy(&rebalancingFactorAsInt, &rebalancingFactor_, sizeof(rebalancingFactor_)); // Deprecated
 			int crcValueAsInt;
 			memcpy(&crcValueAsInt, &crcValue, sizeof(crcValue));
 			int header[FLANN_INDEX_HEADER_SIZE] = {
@@ -188,7 +214,7 @@ std::vector<unsigned char> FlannIndex::serializeIndex(bool computeChecksum) cons
 					algorithm_,                                                          // 3,
 					featuresDim_,                                                        // 4,
 					useDistanceL1_?1:0,                                                  // 5,
-					rebalancingFactorAsInt,                                              // 6,
+					rebalancingFactorAsInt,                                              // 6, Deprecated
 					dataRows,                                                            // 7,
 					dataCols,                                                            // 8,			
 					dataType,                                                            // 9,
@@ -199,7 +225,7 @@ std::vector<unsigned char> FlannIndex::serializeIndex(bool computeChecksum) cons
 				header[3],
 				header[4],
 				header[5],
-				rebalancingFactor_,
+				rebalancingFactor_, // Deprecated
 				header[7], header[8], header[9], crcValueAsInt, 
 				header[11]);
 			memcpy(indexData.data(), header, headerSizeBytes);
@@ -214,7 +240,17 @@ std::vector<unsigned char> FlannIndex::serializeIndex(bool computeChecksum) cons
 	return std::vector<unsigned char>();
 }
 
-size_t FlannIndex::indexedFeatures() const
+int RtFlannIndex::featuresType() const 
+{
+	return featuresType_;
+}
+
+int RtFlannIndex::featuresDim() const 
+{
+	return featuresDim_;
+}
+
+size_t RtFlannIndex::indexedFeatures() const
 {
 	if(!index_)
 	{
@@ -242,13 +278,13 @@ size_t FlannIndex::indexedFeatures() const
 }
 
 // return Bytes
-size_t FlannIndex::memoryUsed() const
+size_t RtFlannIndex::memoryUsed() const
 {
 	if(!index_)
 	{
 		return 0;
 	}
-	size_t memoryUsage = sizeof(FlannIndex);
+	size_t memoryUsage = sizeof(RtFlannIndex);
 	memoryUsage += addedDescriptors_.size() * (sizeof(int) + sizeof(cv::Mat) + sizeof(std::map<int, cv::Mat>::iterator)) + sizeof(std::map<int, cv::Mat>);
 	memoryUsage += sizeof(std::list<int>) + removedIndexes_.size() * sizeof(int);
 	if(featuresType_ == CV_8UC1)
@@ -273,7 +309,7 @@ size_t FlannIndex::memoryUsed() const
 	return memoryUsage;
 }
 
-void FlannIndex::buildIndex(
+void RtFlannIndex::buildIndex(
 		flann_algorithm_t algorithm,
 		const cv::Mat & features,
 		bool useDistanceL1,
@@ -304,6 +340,7 @@ void FlannIndex::buildIndex(
 		break;
 	case FLANN_INDEX_LSH:
 		UASSERT(features.type() == CV_8UC1);
+		UASSERT_MSG(features.cols >= 8, "LSH requires a minimum of 8 dimensions to provide valid results.");
 		params = rtflann::LshIndexParams(12, 20, 2);
 		break;
 	default:
@@ -355,7 +392,7 @@ void FlannIndex::buildIndex(
 	UDEBUG("");
 }
 
-bool FlannIndex::loadIndex(
+bool RtFlannIndex::loadIndex(
 	const std::vector<unsigned char> & indexData,
 	flann_algorithm_t algorithm,
 	const cv::Mat & features,
@@ -372,7 +409,7 @@ bool FlannIndex::loadIndex(
 		rebalancingFactor),
 		error;
 }
-bool FlannIndex::loadIndex(
+bool RtFlannIndex::loadIndex(
 	const unsigned char * indexData,
 	size_t indexDataSize,
 	flann_algorithm_t algorithm,
@@ -401,12 +438,12 @@ bool FlannIndex::loadIndex(
 		return false;
 	}
 	const int * header = (const int *)indexData;
-	
+
 	int savedAlgorithm = header[3];
 	int savedDim = header[4];
 	bool savedDistanceL1 = header[5]==1;
-	float savedRebalancingFactor;
-	memcpy(&savedRebalancingFactor, &header[6], sizeof(header[6]));
+	float savedRebalancingFactor; // Deprecated
+	memcpy(&savedRebalancingFactor, &header[6], sizeof(header[6])); // Deprecated
 	int savedRows = header[7];
 	int savedCols = header[8];
 	int savedType = header[9];
@@ -414,12 +451,13 @@ bool FlannIndex::loadIndex(
 	 memcpy(&savedCrc, &header[10], sizeof(header[10]));
 	int savedIndexSize = header[11];
 
-	UDEBUG("Header: \"%d.%d.%d\" alg=%d dim=%d L1=%d factor=%f data(%dx%d type=%d, crc=%X) %d", 
+	UDEBUG("Header: \"%d.%d.%d\" alg=%d dim=%d L1=%d factor=%f (deprecated, using %f instead) data(%dx%d type=%d, crc=%X) index size = %d bytes", 
 				header[0],header[1],header[2],
 				header[3],
 				header[4],
 				header[5],
-				savedRebalancingFactor,
+				savedRebalancingFactor, // Deprecated
+				rebalancingFactor,
 				header[7], header[8], header[9], savedCrc, 
 				header[11]);
 
@@ -441,12 +479,6 @@ bool FlannIndex::loadIndex(
 		}
 		return false;
 	}
-	if(savedRebalancingFactor != rebalancingFactor) {
-		if(error) {
-			*error = uFormat("Serialized \"rebalancing factor\" (%f) doesn't match the expected one (%f).", savedRebalancingFactor, rebalancingFactor);
-		}
-		return false;
-	}
 	if(savedRows != features.rows) {
 		if(error) {
 			*error = uFormat("Serialized feature count (%d) doesn't match the expected one (%d).", savedRows, features.rows);
@@ -459,6 +491,10 @@ bool FlannIndex::loadIndex(
 		}
 		return false;
 	}
+	// Raw cv::Mat type comparison: safe only because descriptors are always
+	// single-channel, whose type value is identical under OpenCV 4 and 5
+	// (OpenCV 5 changed CV_CN_SHIFT, which only shifts multi-channel types).
+	// See the note where the header is written in serializeIndex().
 	if(savedType != features.type()) {
 		if(error) {
 			*error = uFormat("Serialized feature type (%d) doesn't match the expected one (%d).", savedType, features.type());
@@ -478,7 +514,7 @@ bool FlannIndex::loadIndex(
 	}
 	if(savedIndexSize != int(indexDataSize - headerSizeBytes)) {
 		if(error) {
-			*error = uFormat("Serialized flann index size (%ld) doesn't match the expected one (%ld).", savedIndexSize, indexDataSize - headerSizeBytes);
+			*error = uFormat("Serialized flann index size (%ld) doesn't match the expected one (%ld).", (long)savedIndexSize, indexDataSize - headerSizeBytes);
 		}
 		return false;
 	}
@@ -553,7 +589,7 @@ bool FlannIndex::loadIndex(
 
 	// incremental FLANN: we should add all headers separately in case we remove
 	// some indexes (to keep underlying matrix data allocated)
-	
+
 	if(rebalancingFactor_ > 1.0f)
 	{
 		for(int i=0; i<features.rows; ++i)
@@ -571,12 +607,12 @@ bool FlannIndex::loadIndex(
 #endif
 }
 
-bool FlannIndex::isBuilt()
+bool RtFlannIndex::isBuilt()
 {
 	return index_!=0;
 }
 
-std::vector<unsigned int> FlannIndex::addPoints(const cv::Mat & features)
+std::vector<unsigned int> RtFlannIndex::addPoints(const cv::Mat & features)
 {
 	if(!index_)
 	{
@@ -672,7 +708,7 @@ std::vector<unsigned int> FlannIndex::addPoints(const cv::Mat & features)
 	return indexes;
 }
 
-void FlannIndex::removePoint(unsigned int index)
+void RtFlannIndex::removePoint(unsigned int index)
 {
 	if(!index_)
 	{
@@ -705,7 +741,7 @@ void FlannIndex::removePoint(unsigned int index)
 	removedIndexes_.push_back(index);
 }
 
-void FlannIndex::knnSearch(
+void RtFlannIndex::knnSearch(
 		const cv::Mat & query,
 		cv::Mat & indices,
 		cv::Mat & dists,
@@ -719,10 +755,11 @@ void FlannIndex::knnSearch(
 		UERROR("Flann index not yet created!");
 		return;
 	}
-	indices.create(query.rows, knn, sizeof(size_t)==8?CV_64F:CV_32S);
-	dists.create(query.rows, knn, featuresType_ == CV_8UC1?CV_32S:CV_32F);
 
-	rtflann::Matrix<size_t> indicesF((size_t*)indices.data, indices.rows, indices.cols);
+	dists = cv::Mat(query.rows, knn, featuresType_ == CV_8UC1?CV_32S:CV_32F, cv::Scalar(-1));
+
+	std::vector<size_t> indicesBuffer(query.rows * knn, std::numeric_limits<size_t>::max());
+	rtflann::Matrix<size_t> indicesF((size_t*)indicesBuffer.data(), query.rows, knn);
 
 	rtflann::SearchParams params = rtflann::SearchParams(checks, eps, sorted);
 
@@ -749,9 +786,17 @@ void FlannIndex::knnSearch(
 			((rtflann::Index<rtflann::L2<float> >*)index_)->knnSearch(queryF, indicesF, distsF, knn, params);
 		}
 	}
+
+	indices.create(query.rows, knn, CV_32S);
+	int * ptr = indices.ptr<int>();
+	for(size_t i=0 ; i<indicesBuffer.size(); i+=2)
+	{
+		ptr[i] = indicesBuffer[i] == std::numeric_limits<size_t>::max()?-1:(int)indicesBuffer[i];
+		ptr[i+1] = indicesBuffer[i+1] == std::numeric_limits<size_t>::max()?-1:(int)indicesBuffer[i+1];
+	}
 }
 
-void FlannIndex::radiusSearch(
+void RtFlannIndex::radiusSearch(
 		const cv::Mat & query,
 		std::vector<std::vector<size_t> > & indices,
 		std::vector<std::vector<float> > & dists,
@@ -802,5 +847,138 @@ void FlannIndex::radiusSearch(
 		}
 	}
 }
+
+
+NanoFlannIndex::NanoFlannIndex() : 
+	index_(NULL),
+	isBuilt_(false) 
+{
+}
+
+NanoFlannIndex::~NanoFlannIndex() 
+{ 
+	if (this) {
+		release(); 
+	}
+}
+
+void NanoFlannIndex::release() {
+	if (index_) {
+		delete index_;
+		index_ = 0;
+	}
+	index_ = NULL;
+	pc_adapter_.pts.clear();
+	isBuilt_ = false;
+}
+
+std::vector<unsigned char> NanoFlannIndex::serializeIndex(bool computeChecksum) const {
+	return std::vector<unsigned char>();
+}
+
+size_t NanoFlannIndex::indexedFeatures() const { 
+	return pc_adapter_.pts.size();
+ }
+size_t NanoFlannIndex::memoryUsed() const { 
+	return pc_adapter_.pts.size() * sizeof(cv::Point2f);
+}
+
+void NanoFlannIndex::buildIndex(
+		flann_algorithm_t algorithm,
+		const cv::Mat & features,
+		bool useDistanceL1,
+		float rebalancingFactor) 
+{
+	release(); // Сбрасываем старые данные, если они были
+
+	if (features.empty()) return;
+
+	// Конвертируем cv::Mat (координаты X и Y) в наш внутренний вектор точек pc_adapter_
+	pc_adapter_.pts.resize(features.rows);
+	for (int i = 0; i < features.rows; ++i) {
+		pc_adapter_.pts[i].x = features.at<float>(i, 0);
+		pc_adapter_.pts[i].y = features.at<float>(i, 1);
+	}
+
+	index_ = new MyKDTree(2, pc_adapter_, nanoflann::KDTreeSingleIndexAdaptorParams(10 /* max leaf */));
+	index_->buildIndex();
+
+	isBuilt_ = true;
+}
+
+bool NanoFlannIndex::loadIndex(const std::vector<unsigned char> & indexData, flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1, float rebalancingFactor, std::string * errorMsg) { return false; }
+bool NanoFlannIndex::loadIndex(const unsigned char * indexData, size_t indexDataSize, flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1, float rebalancingFactor, std::string * errorMsg) { return false; }
+
+bool NanoFlannIndex::isBuilt() { return isBuilt_; }
+int NanoFlannIndex::featuresType() const { return CV_32FC1; }
+int NanoFlannIndex::featuresDim() const { return 2; }
+
+std::vector<unsigned int> NanoFlannIndex::addPoints(const cv::Mat & features) {
+	return std::vector<unsigned int>();
+}
+
+void NanoFlannIndex::removePoint(unsigned int index) {}
+
+void NanoFlannIndex::knnSearch(
+		const cv::Mat & query,
+		cv::Mat & indices,
+		cv::Mat & dists,
+		int knn,
+		int checks,
+		float eps,
+		bool sorted) const 
+{
+	if (!isBuilt_ || !index_ || query.empty()) return;
+
+	indices = cv::Mat(query.rows, knn, CV_32SC1, cv::Scalar(-1));
+	dists = cv::Mat(query.rows, knn, CV_32FC1, cv::Scalar(-1.0f));
+
+	for (int i = 0; i < query.rows; ++i) {
+		float query_pt[2] = { query.at<float>(i, 0), query.at<float>(i, 1) };
+		
+		std::vector<uint32_t> ret_index(knn);
+		std::vector<float> out_dist_sqr(knn);
+		
+		size_t num_results = index_->knnSearch(&query_pt[0], knn, &ret_index[0], &out_dist_sqr[0]);
+		
+		for (size_t j = 0; j < num_results; ++j) {
+			indices.at<int>(i, j) = static_cast<int>(ret_index[j]);
+			dists.at<float>(i, j) = out_dist_sqr[j];
+		}
+	}
+}
+
+void NanoFlannIndex::radiusSearch(
+		const cv::Mat & query,
+		std::vector<std::vector<size_t> > & indices,
+		std::vector<std::vector<float> > & dists,
+		float radius,
+		int maxNeighbors,
+		int checks,
+		float eps,
+		bool sorted) const {
+			if (!isBuilt_ || !index_ || query.empty()) return;
+
+			indices.resize(query.rows);
+			dists.resize(query.rows);
+			float search_radius_sqr = radius * radius;
+
+			nanoflann::SearchParameters search_params;
+			search_params.sorted = sorted; 
+
+			for (int i = 0; i < query.rows; ++i) {
+				float query_pt[2] = { query.at<float>(i, 0), query.at<float>(i, 1) };
+				
+				std::vector<nanoflann::ResultItem<uint32_t, float>> matches;
+				index_->radiusSearch(query_pt, search_radius_sqr, matches, search_params);
+				
+				indices[i].reserve(matches.size());
+				dists[i].reserve(matches.size());
+				for (const auto& match : matches) {
+					indices[i].push_back(static_cast<size_t>(match.first));   // Индекс найденной точки
+					dists[i].push_back(match.second);                        // Квадрат расстояния
+				}
+			}
+		}
 
 } /* namespace rtabmap */
