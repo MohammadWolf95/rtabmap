@@ -32,84 +32,201 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <list>
 #include <opencv2/opencv.hpp>
 
-#include <nanoflann.hpp>
-
 namespace rtabmap {
 
+class NanoFlannIndex;
+
+/**
+ * @class FlannIndex
+ * @brief Nearest neighbor index over a set of features
+ *
+ * Wraps the search structures of the vendored rtflann and nanoflann libraries
+ * behind one interface, the structure being chosen with flann_algorithm_t at
+ * build time. Used for the visual word dictionary (VWDictionary) and for the
+ * 2D point searches of visual registration (RegistrationVis).
+ *
+ * The features are not copied: the index refers to the matrices it is given and
+ * keeps them alive, cv::Mat data being reference counted, so they must not be
+ * modified in place while it is in use. Every point it holds is
+ * designated by an index, assigned in the order the points were added and
+ * stable for the lifetime of the index: removePoint() leaves a hole rather
+ * than renumbering the points after it.
+ */
 class RTABMAP_CORE_EXPORT FlannIndex
 {
 public:
-	enum Type {
-		kRtFlann,
-		kNanoFlann
-	};
-
-	static FlannIndex* create(Type type = kRtFlann);
-
-	// A forward of the internal enum, indexes should match. See src/rtflann/defines.h
+	/**
+	 * @enum flann_algorithm_t
+	 * @brief The index structure built by buildIndex()
+	 *
+	 * The values under 8 are forwarded from rtflann's own enum and have to
+	 * match it (see src/rtflann/defines.h); the nanoflann ones are
+	 * rtabmap-specific and kept outside its range (0-7, 254, 255). A value is
+	 * written in the serialized index header and checked back on load, so none
+	 * of them may be renumbered.
+	 *
+	 * The nanoflann structures take float features only (nanoflann has no
+	 * Hamming metric) and search exactly, ignoring "checks". That makes them
+	 * the fastest ones for 2D and 3D points, and the wrong ones for
+	 * descriptors: an exact search visits more and more of the tree as the
+	 * dimension grows, down to being as slow as an exhaustive search. Prefer
+	 * the approximate rtflann kd-trees for those.
+	 */
 	enum flann_algorithm_t
 	{
-		FLANN_INDEX_LINEAR 			= 0,
-		FLANN_INDEX_KDTREE 			= 1,
-		FLANN_INDEX_KDTREE_SINGLE   = 4,
-		FLANN_INDEX_LSH 			= 6,
+		FLANN_INDEX_LINEAR 			= 0, ///< Exhaustive search
+		FLANN_INDEX_KDTREE 			= 1, ///< 4 randomized kd-trees, searched approximately
+		FLANN_INDEX_KDTREE_SINGLE   = 4, ///< Single kd-tree, searched exactly
+		FLANN_INDEX_LSH 			= 6, ///< Locality-Sensitive Hashing (binary descriptors)
+
+		/// nanoflann kd-tree. With a rebalancing factor of 1 it is built once,
+		/// which is the cheapest to build and to search; over 1 it is the
+		/// weight-balanced tree accepting addPoints()/removePoint(), which
+		/// cannot be serialized while some of its points are removed.
+		NANOFLANN_INDEX_KDTREE_SINGLE = 100,
 	};
 
 	FlannIndex();
 	virtual ~FlannIndex();
 
-	virtual void release() = 0;
-	virtual std::vector<unsigned char> serializeIndex(bool computeChecksum = true) const = 0;
+	/** @brief Drop the index and everything it holds, back to the state of a new one. */
+	void release();
 
-	virtual size_t indexedFeatures() const = 0;
+	/**
+	 * @brief Serialize the index, to be given back to loadIndex()
+	 * @param computeChecksum Add a checksum of the indexed features to the
+	 *        data, which loadIndex() compares against the features it is given
+	 * @return The serialized index, empty when there is nothing to serialize or
+	 *         when the structure in use cannot be
+	 *
+	 * The format depends on the architecture and on the versions of the
+	 * vendored libraries: loadIndex() refuses an index it cannot read, leaving
+	 * it to be rebuilt.
+	 */
+	std::vector<unsigned char> serializeIndex(bool computeChecksum = true) const;
 
-	// return Bytes
-	virtual size_t memoryUsed() const = 0;
+	/** @return Number of indexed features, the removed ones excluded. */
+	size_t indexedFeatures() const;
 
-	// Note that useDistanceL1 doesn't have any effect if LSH is used
-	virtual void buildIndex(
+	/**
+	 * @return Bytes used by the index, the features themselves excluded as
+	 *         they are only referred to.
+	 */
+	size_t memoryUsed() const;
+
+	/**
+	 * @brief Build the index over the given features, releasing any previous one
+	 * @param algorithm The structure to build
+	 * @param features One feature per row, CV_32FC1 or, for the rtflann
+	 *        structures only, CV_8UC1 for binary descriptors (Hamming distance)
+	 * @param useDistanceL1 Search with the L1 distance instead of L2, ignored
+	 *        by LSH and by the binary descriptors
+	 * @param rebalancingFactor Fraction (factor-1)/factor of the index that can
+	 *        be left removed before it is rebuilt, e.g. half of it for 2. Set
+	 *        to 1 to never rebuild it.
+	 */
+	void buildIndex(
 			flann_algorithm_t algorithm,
 			const cv::Mat & features,
 			bool useDistanceL1 = false,
-			float rebalancingFactor = 2.0f) = 0;
-	// Return false if the indexData doesn't correspond to expected features used and parameters.
-	virtual bool loadIndex(
+			float rebalancingFactor = 2.0f);
+
+	/**
+	 * @brief Load an index serialized by serializeIndex(), releasing any previous one
+	 * @param indexData The serialized index
+	 * @param algorithm The structure it was built with
+	 * @param features The very same features it was built with, in the same
+	 *        order: the index refers to them by their row
+	 * @param useDistanceL1 The distance it was built with
+	 * @param rebalancingFactor See buildIndex(). The serialized data carries the
+	 *        one the index was built with, which is deprecated and ignored:
+	 *        this one is used instead.
+	 * @param errorMsg Filled with what didn't match when the index is refused
+	 * @return False if the data doesn't correspond to the given features and
+	 *         parameters, in which case the index is left released
+	 */
+	bool loadIndex(
 		const std::vector<unsigned char> & indexData,
 		flann_algorithm_t algorithm,
 		const cv::Mat & features,
 		bool useDistanceL1 = false,
 		float rebalancingFactor = 2.0f,
-		std::string * errorMsg = NULL) = 0;
-	virtual bool loadIndex(
+		std::string * errorMsg = NULL);
+	/** @brief Load an index from a raw buffer, see the overload above. */
+	bool loadIndex(
 		const unsigned char * indexData,
 		size_t indexDataSize,
 		flann_algorithm_t algorithm,
 		const cv::Mat & features,
 		bool useDistanceL1 = false,
 		float rebalancingFactor = 2.0f,
-		std::string * errorMsg = NULL) = 0;
+		std::string * errorMsg = NULL);
 
-	virtual bool isBuilt() = 0;
+	/** @return Whether an index has been built or loaded. */
+	bool isBuilt();
 
-	virtual int featuresType() const = 0;
-	virtual int featuresDim() const = 0;
+	/** @return Type of the indexed features (CV_32FC1 or CV_8UC1). */
+	int featuresType() const {return featuresType_;}
+	/** @return Dimension of the indexed features. */
+	int featuresDim() const {return featuresDim_;}
 
-	virtual std::vector<unsigned int> addPoints(const cv::Mat & features) = 0;
+	/**
+	 * @brief Add features to the index
+	 * @param features One feature per row, of the type and dimension the index
+	 *        was built with
+	 * @return The index assigned to each of them, empty when the structure
+	 *         doesn't accept points after it is built
+	 */
+	std::vector<unsigned int> addPoints(const cv::Mat & features);
 
-	virtual void removePoint(unsigned int index) = 0;
+	/**
+	 * @brief Remove an indexed feature, by the index addPoints() gave for it
+	 *
+	 * The feature is only marked as removed: it is skipped by the searches, but
+	 * keeps taking memory until the index is rebuilt (see the rebalancing
+	 * factor of buildIndex()). Not supported by every structure.
+	 */
+	void removePoint(unsigned int index);
 
-	// return squared distances (indices should be casted in size_t)
-	virtual void knnSearch(
+	/**
+	 * @brief Search the k nearest neighbors of each query
+	 * @param query One feature per row, of the type and dimension the index was
+	 *        built with
+	 * @param indices Neighbors found, one query per row, CV_32SC1. The
+	 *        neighbors that couldn't be found are set to -1.
+	 * @param dists Their squared distances, CV_32FC1, or CV_32SC1 for the
+	 *        Hamming distances of binary descriptors
+	 * @param knn Number of neighbors to search for
+	 * @param checks Number of leaves an approximate search visits, the exact
+	 *        structures ignoring it
+	 * @param eps Search for eps-approximate neighbors
+	 * @param sorted Give the neighbors back by increasing distance
+	 */
+	void knnSearch(
 			const cv::Mat & query,
 			cv::Mat & indices,
 			cv::Mat & dists,
 	        int knn,
 			int checks = 32,
 			float eps = 0.0,
-			bool sorted = true) const = 0;
+			bool sorted = true) const;
 
-	// return squared distances
-	virtual void radiusSearch(
+	/**
+	 * @brief Search the neighbors of each query within a radius
+	 * @param query One feature per row, of the type and dimension the index was
+	 *        built with
+	 * @param indices Neighbors found, one vector per query
+	 * @param dists Their squared distances, one vector per query
+	 * @param radius Search radius, squared internally: it is a distance, not a
+	 *        squared one
+	 * @param maxNeighbors Maximum number of neighbors per query, the nearest
+	 *        ones being kept. 0 for all of them.
+	 * @param checks Number of leaves an approximate search visits, the exact
+	 *        structures ignoring it
+	 * @param eps Search for eps-approximate neighbors
+	 * @param sorted Give the neighbors back by increasing distance
+	 */
+	void radiusSearch(
 			const cv::Mat & query,
 			std::vector<std::vector<size_t> > & indices,
 			std::vector<std::vector<float> > & dists,
@@ -117,84 +234,22 @@ public:
 			int maxNeighbors = 0,
 			int checks = 32,
 			float eps = 0.0,
-			bool sorted = true) const = 0;
-};
-
-class RTABMAP_CORE_EXPORT RtFlannIndex : public FlannIndex
-{
-public:
-	RtFlannIndex();
-	virtual ~RtFlannIndex();
-
-	virtual void release() override;
-	virtual std::vector<unsigned char> serializeIndex(bool computeChecksum = true) const override;
-	virtual size_t indexedFeatures() const override;
-	virtual size_t memoryUsed() const override;
-	virtual void buildIndex(flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1 = false, float rebalancingFactor = 2.0f) override;
-	virtual bool loadIndex(const std::vector<unsigned char> & indexData, flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1 = false, float rebalancingFactor = 2.0f, std::string * errorMsg = NULL) override;
-	virtual bool loadIndex(const unsigned char * indexData, size_t indexDataSize, flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1 = false, float rebalancingFactor = 2.0f, std::string * errorMsg = NULL) override;
-	virtual bool isBuilt() override;
-	virtual int featuresType() const override;
-	virtual int featuresDim() const override;
-	virtual std::vector<unsigned int> addPoints(const cv::Mat & features) override;
-	virtual void removePoint(unsigned int index) override;
-	virtual void knnSearch(const cv::Mat & query, cv::Mat & indices, cv::Mat & dists, int knn, int checks = 32, float eps = 0.0, bool sorted = true) const override;
-	virtual void radiusSearch(const cv::Mat & query, std::vector<std::vector<size_t> > & indices, std::vector<std::vector<float> > & dists, float radius, int maxNeighbors = 0, int checks = 32, float eps = 0.0, bool sorted = true) const override;
+			bool sorted = true) const;
 
 private:
-	void * index_;
+	void * index_;               // rtflann backend
+	NanoFlannIndex * nanoIndex_; // nanoflann backend, only one of the two is set
 	unsigned int nextIndex_;
 	int featuresType_;
 	int featuresDim_;
-	bool useDistanceL1_; 
+	bool useDistanceL1_; // true=EUCLEDIAN_L2 false=MANHATTAN_L1
 	float rebalancingFactor_;
 	flann_algorithm_t algorithm_;
 
+	// keep feature in memory until the tree is rebuilt
+	// (in case the word is deleted when removed from the VWDictionary)
 	std::map<int, cv::Mat> addedDescriptors_;
 	std::list<int> removedIndexes_;
-};
-
-class RTABMAP_CORE_EXPORT NanoFlannIndex : public FlannIndex
-{
-public:
-	NanoFlannIndex();
-	virtual ~NanoFlannIndex();
-
-	virtual void release() override;
-	virtual std::vector<unsigned char> serializeIndex(bool computeChecksum = true) const override;
-	virtual size_t indexedFeatures() const override;
-	virtual size_t memoryUsed() const override;
-	virtual void buildIndex(flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1 = false, float rebalancingFactor = 2.0f) override;
-	virtual bool loadIndex(const std::vector<unsigned char> & indexData, flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1 = false, float rebalancingFactor = 2.0f, std::string * errorMsg = NULL) override;
-	virtual bool loadIndex(const unsigned char * indexData, size_t indexDataSize, flann_algorithm_t algorithm, const cv::Mat & features, bool useDistanceL1 = false, float rebalancingFactor = 2.0f, std::string * errorMsg = NULL) override;
-	virtual bool isBuilt() override;
-	virtual int featuresType() const override;
-	virtual int featuresDim() const override;
-	virtual std::vector<unsigned int> addPoints(const cv::Mat & features) override;
-	virtual void removePoint(unsigned int index) override;
-	virtual void knnSearch(const cv::Mat & query, cv::Mat & indices, cv::Mat & dists, int knn, int checks = 32, float eps = 0.0, bool sorted = true) const override;
-	virtual void radiusSearch(const cv::Mat & query, std::vector<std::vector<size_t> > & indices, std::vector<std::vector<float> > & dists, float radius, int maxNeighbors = 0, int checks = 32, float eps = 0.0, bool sorted = true) const override;
-
-private:
-	struct PointCloudAdapter {
-        std::vector<cv::Point2f> pts; // Храним точки прямо внутри адаптера
-        inline size_t kdtree_get_point_count() const { return pts.size(); }
-        inline float kdtree_get_pt(const size_t idx, const size_t dim) const {
-            return (dim == 0) ? pts[idx].x : pts[idx].y;
-        }
-        template <class BBOX> bool kdtree_get_bbox(BBOX& /* bb */) const { return false; }
-    };
-
-    // Определение типа дерева, которое использует этот адаптер
-    typedef nanoflann::KDTreeSingleIndexAdaptor<
-        nanoflann::L2_Simple_Adaptor<float, PointCloudAdapter>,
-        PointCloudAdapter,
-        2
-    > MyKDTree;
-
-    PointCloudAdapter pc_adapter_; // Сам объект адаптера
-    MyKDTree* index_;              // Указатель на дерево nanoflann
-    bool isBuilt_; 
 };
 
 } /* namespace rtabmap */

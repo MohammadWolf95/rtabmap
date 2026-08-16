@@ -63,10 +63,6 @@ ELSE()
     option(FLANN_KDTREE_MEM_OPT  "Disable multi-threaded FLANN kd-tree to minimize memory allocations"   ON)
 ENDIF()
 
-IF(FLANN_KDTREE_MEM_OPT)
-    ADD_DEFINITIONS("-DFLANN_KDTREE_MEM_OPT")
-ENDIF(FLANN_KDTREE_MEM_OPT)
-
 IF(WIN32 AND NOT MINGW)
     ADD_DEFINITIONS("-DNOMINMAX")
     ADD_DEFINITIONS("-wd4100 -wd4127 -wd4150 -wd4191 -wd4242 -wd4244 -wd4251 -wd4305 -wd4365 -wd4512 -wd4514 -wd4548 -wd4571 -wd4619 -wd4625 -wd4626 -wd4628 -wd4668 -wd4710 -wd4711 -wd4738 -wd4820 -wd4946 -wd4986")
@@ -167,6 +163,68 @@ ENDIF(APPLE OR WIN32)
 OPTION(BUILD_APP "Build main application" ON)
 OPTION(BUILD_TOOLS "Build tools" ON)
 OPTION(BUILD_EXAMPLES "Build examples" ON)
+# Off by default: it downloads the Doxygen theme at configure time, which an
+# ordinary build has no reason to need. Set by docs-report.sh.
+OPTION(BUILD_DOCUMENTATION "Prepare the API documentation build (downloads the Doxygen theme)" OFF)
+
+# The unit tests are host executables run by ctest, which can't be done from a
+# cross-compiled Android/iOS build.
+if(ANDROID OR IOS OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+   set(BUILD_TESTING OFF CACHE BOOL "Build the testing tree." FORCE)
+endif()
+
+# Performance tests are benchmarks: they report times, memory and recall
+# instead of asserting on them, as those depend on the machine. They are built
+# by default so they cannot rot, but are labelled "performance" so that a run
+# opts in with `ctest -L performance` and CI opts out with `ctest -LE
+# performance`. They can also be run directly, e.g. bin/test_flann_index_perf.
+OPTION(BUILD_PERF_TESTS "Build the performance tests (see ctest -L performance)" ON)
+
+include(CTest)
+if(BUILD_TESTING)
+   # Add GTest using FetchContent
+   include(FetchContent)
+   FetchContent_Declare(
+       googletest
+       URL https://github.com/google/googletest/archive/refs/tags/v1.16.0.zip
+   )
+   FetchContent_GetProperties(googletest)
+   if(NOT googletest_POPULATED)
+     FetchContent_Populate(googletest)
+     add_subdirectory(${googletest_SOURCE_DIR} ${googletest_BINARY_DIR})
+   endif()
+   include(GoogleTest)
+   set(TEST_DATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/data"
+       CACHE PATH "Root directory holding the test fixtures (data/tests/*.db)")
+endif()
+
+OPTION(ENABLE_COVERAGE "Build with gcov/lcov coverage (GCC/Clang, Debug only; see coverage-report.sh)" OFF)
+IF(ENABLE_COVERAGE)
+   IF(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      MESSAGE(FATAL_ERROR "ENABLE_COVERAGE requires GCC or Clang with gcov/lcov (current: ${CMAKE_CXX_COMPILER_ID}).")
+   ENDIF()
+   IF(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+      MESSAGE(FATAL_ERROR "ENABLE_COVERAGE requires CMAKE_BUILD_TYPE=Debug (current: \"${CMAKE_BUILD_TYPE}\").")
+   ENDIF()
+   MESSAGE(STATUS "Coverage instrumentation enabled")
+   ADD_COMPILE_OPTIONS(--coverage -O0 -g)
+   ADD_LINK_OPTIONS(--coverage)
+ENDIF()
+
+# Check UDEBUG/UINFO/UWARN/UERROR/uFormat format strings against their
+# arguments.
+# -Wno-format-zero-length: UDEBUG("") is used deliberately as a trace point
+# -Wformat-security: non-literal format strings, e.g. UERROR(uFormat(...).c_str())
+OPTION(ENABLE_FORMAT_ERRORS "Treat log/uFormat format-string mismatches as errors (GCC/Clang)" OFF)
+IF(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+   ADD_COMPILE_OPTIONS(-Wformat -Wformat-security -Wno-format-zero-length)
+   IF(ENABLE_FORMAT_ERRORS)
+      MESSAGE(STATUS "Format-string mismatches are errors")
+      ADD_COMPILE_OPTIONS(-Werror=format -Werror=format-security)
+   ENDIF()
+ELSEIF(ENABLE_FORMAT_ERRORS)
+   MESSAGE(WARNING "ENABLE_FORMAT_ERRORS has no effect on ${CMAKE_CXX_COMPILER_ID} (needs GCC/Clang)")
+ENDIF()
 
 ####### DEPENDENCIES #######
 IF(MOBILE_BUILD)
@@ -1463,6 +1521,10 @@ MESSAGE(STATUS "  CMAKE_INSTALL_LIBDIR = ${CMAKE_INSTALL_LIBDIR}")
 MESSAGE(STATUS "  BUILD_APP =            ${BUILD_APP}")
 MESSAGE(STATUS "  BUILD_TOOLS =          ${BUILD_TOOLS}")
 MESSAGE(STATUS "  BUILD_EXAMPLES =       ${BUILD_EXAMPLES}")
+MESSAGE(STATUS "  BUILD_TESTING =        ${BUILD_TESTING}")
+MESSAGE(STATUS "  BUILD_PERF_TESTS =     ${BUILD_PERF_TESTS}")
+MESSAGE(STATUS "  ENABLE_COVERAGE =      ${ENABLE_COVERAGE}")
+MESSAGE(STATUS "  ENABLE_FORMAT_ERRORS = ${ENABLE_FORMAT_ERRORS}")
 IF(NOT WIN32)
     # see comment above for the BUILD_SHARED_LIBS option on Windows
     MESSAGE(STATUS "  BUILD_SHARED_LIBS =    ${BUILD_SHARED_LIBS}")

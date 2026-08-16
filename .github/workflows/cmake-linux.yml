@@ -72,9 +72,23 @@ jobs:
       run: |
         ./rtabmap-console --version
 
+<<<<<<< HEAD
 #    - name: Test
 #      working-directory: ${{github.workspace}}/build
 #      # Execute tests defined by the CMake configuration.  
 #      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
 #      run: ctest -C ${{env.BUILD_TYPE}}
       
+=======
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      # PYTHONNOUSERSITE=1: prevent the embedded Python interpreter from
+      # loading numpy / other site-packages from ~/.local that were compiled
+      # against a different ABI than the build-time Python (causes numpy
+      # 1.x/2.x mismatch crashes in test_pydetector / test_pydescriptor /
+      # test_pymatcher).
+      env:
+        PYTHONNOUSERSITE: 1
+      run: |
+        ctest -C ${{env.BUILD_TYPE}} -V -LE performance
+>>>>>>> f647014f... Add FlannIndex abstract interface and implement NanoFlannIndex subclass (#1744)
